@@ -23,9 +23,50 @@ from ta.trend import MACD
 from ta.momentum import RSIIndicator
 from tensorflow.keras.layers import GRU, Bidirectional
 from sklearn.metrics import precision_score, recall_score, f1_score
+import subprocess
+import sys
 
 # Initialize rich console
 console = Console()
+
+def install_requirements():
+    """Auto install missing packages"""
+    required_packages = [
+        'pandas',
+        'numpy',
+        'ccxt',
+        'scikit-learn',
+        'tensorflow',
+        'psutil',
+        'rich',
+        'requests',
+        'ta'
+    ]
+    
+    for package in required_packages:
+        try:
+            __import__(package)
+        except ImportError:
+            print(f"Installing {package}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+def setup_environment():
+    """Setup required directories and files"""
+    # Create directories
+    for dir_name in ['data', 'models', 'logs']:
+        if not os.path.exists(dir_name):
+            os.makedirs(dir_name)
+            
+    # Create empty data files if needed
+    data_files = {
+        'data/historical_data.csv': 'Timestamp,Open,High,Low,Close,Volume\n',
+        'models/model_metadata.json': '{"last_training": null, "best_accuracy": 0}\n'
+    }
+    
+    for file_path, header in data_files.items():
+        if not os.path.exists(file_path):
+            with open(file_path, 'w') as f:
+                f.write(header)
 
 # Tính RSI
 def calculate_rsi(data, periods=14):
@@ -330,11 +371,20 @@ def update_training_metrics(metrics):
 def train_with_time_limit(hours, cpu_limit=95, initial_accuracy=0):
     """Modified training for DOGE"""
     print(f"🕒 Starting DOGE training for {hours} hours...")
-    
+    end_time = datetime.now() + timedelta(hours=hours)
+    best_accuracy = initial_accuracy
+    consecutive_fails = 0
+    max_fails = 5
+    model_path = 'doge_trend_model.keras'
+    best_model_path = 'doge_best_model.keras'
+    model = None  # Initialize model variable
+    start_time = datetime.now()
+
     # Load or fetch historical data
     historical_data = load_or_fetch_historical_data(
-        symbol='DOGE/USDT',
+        timeframe='5m',
         total_samples=100000,
+        symbol='DOGE/USDT',
         data_file='doge_historical.csv'
     )
     
@@ -342,14 +392,10 @@ def train_with_time_limit(hours, cpu_limit=95, initial_accuracy=0):
         print("❌ Could not load or fetch DOGE data")
         return 0
 
-    # Rest of the training code remains the same
-    print(f"🕒 Bắt đầu huấn luyện trong {hours} giờ...")
-    end_time = datetime.now() + timedelta(hours=hours)
-    best_accuracy = initial_accuracy
-    consecutive_fails = 0
-    max_fails = 5
-    model_path = 'btc_trend_model.keras'
-    best_model_path = 'best_model.keras'
+    # Process initial data to get input shape
+    scaled_data, scaler, _ = preprocess_data(historical_data)
+    X, y = create_trend_dataset(scaled_data)
+    input_shape = (X.shape[1], X.shape[2])
 
     # Load existing model if available
     if os.path.exists(model_path):
@@ -357,8 +403,6 @@ def train_with_time_limit(hours, cpu_limit=95, initial_accuracy=0):
             model = load_model(model_path)
             print("✅ Đã tải model cũ thành công")
             # Evaluate existing model
-            scaled_data, scaler, _ = preprocess_data(historical_data)
-            X, y = create_trend_dataset(scaled_data)
             train_size = int(len(X) * 0.8)
             _, X_test = X[:train_size], X[train_size:]
             _, y_test = y[:train_size], y[train_size:]
@@ -366,30 +410,28 @@ def train_with_time_limit(hours, cpu_limit=95, initial_accuracy=0):
             best_accuracy = np.mean((predictions > 0.5).astype(int).flatten() == y_test)
             print(f"📊 Độ chính xác model cũ: {best_accuracy:.2%}")
             # Save a backup of the old model
-            model.save(f'backup_{datetime.now().strftime("%Y%m%d_%H%M")}_model.keras')
+            model.save(f'doge_backup_{datetime.now().strftime("%Y%m%d_%H%M")}_model.keras')
         except Exception as e:
             print(f"⚠️ Không thể tải model cũ: {str(e)}")
             model = None
             best_accuracy = 0
-    else:
-        print("ℹ️ Không tìm thấy model cũ, sẽ tạo model mới")
-        model = None
+    
+    # Create new model if none exists
+    if model is None:
+        print("🔄 Tạo model mới...")
+        model = create_model(input_shape)
 
-    start_time = datetime.now()
     while datetime.now() < end_time:
         try:
-            # Kiểm soát tài nguyên
-            limit_cpu_usage(cpu_limit)
-            
-            # Cập nhật dữ liệu
+            # Get fresh data
             historical_data = get_combined_data(historical_data)
             if historical_data is None or historical_data.empty:
-                print("❌ Không thể lấy dữ liệu")
+                print("❌ Không thể lấy dữ liệu mới")
                 time.sleep(60)
                 continue
 
-            # Xử lý dữ liệu
-            scaled_data, scaler, features = preprocess_data(historical_data)  # Properly unpack all three values
+            # Preprocess data
+            scaled_data, scaler, _ = preprocess_data(historical_data)
             X, y = create_trend_dataset(scaled_data)
             
             if len(X) < 100:
@@ -397,91 +439,29 @@ def train_with_time_limit(hours, cpu_limit=95, initial_accuracy=0):
                 time.sleep(60)
                 continue
 
-            # Chia tập train/test
+            # Split data
             train_size = int(len(X) * 0.8)
             X_train, X_test = X[:train_size], X[train_size:]
             y_train, y_test = y[:train_size], y[train_size:]
 
-            # Update model initialization to use existing model if available
-            if model is None:
-                model = Sequential([
-                    LSTM(256, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
-                    Dropout(0.3),
-                    LSTM(128),
-                    Dropout(0.3),
-                    Dense(1, activation='sigmoid')
-                ])
-                model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-            
-            # Training configuration
-            batch_size = 64  # Increased batch size
-            epochs = 50     # Fixed number of epochs
-            time_step = 150  # Longer sequence length
-            
-            # Modified callbacks - remove EarlyStopping
-            callbacks = [
-                ReduceLROnPlateau(
-                    monitor='val_loss',
-                    factor=0.5,
-                    patience=10,
-                    min_lr=0.00001,
-                    cooldown=5
-                ),
-                tf.keras.callbacks.ModelCheckpoint(
-                    'checkpoint_model.keras',
-                    monitor='val_accuracy',
-                    save_best_only=True,
-                    mode='max',
-                    verbose=1
-                )
-            ]
-
-            print("\n🚀 Bắt đầu huấn luyện 50 epochs...\n")
-            
-            # Force training for exactly 50 epochs
+            # Train model
             history = model.fit(
                 X_train, y_train,
-                batch_size=batch_size,
-                epochs=50,  # Fixed 50 epochs
+                batch_size=64,
+                epochs=50,
                 validation_split=0.2,
-                callbacks=callbacks,
-                verbose=1,
-                shuffle=True
+                verbose=1
             )
 
-            # Track best accuracy during training
-            val_accuracies = history.history['val_accuracy']
-            best_val_accuracy = max(val_accuracies)
-            best_epoch = val_accuracies.index(best_val_accuracy) + 1
-            
-            print(f"\n📊 Kết quả sau 50 epochs:")
-            print(f"- Độ chính xác tốt nhất (validation): {best_val_accuracy:.2%}")
-            print(f"- Đạt được ở epoch: {best_epoch}/50")
+            # Evaluate model
+            predictions = model.predict(X_test, verbose=0)
+            current_accuracy = np.mean((predictions > 0.5).astype(int).flatten() == y_test)
 
-            # Evaluate final model
-            metrics, predictions = evaluate_model(model, X_test, y_test)
-            current_accuracy = metrics['accuracy']
-            
-            # Save logic with better model tracking
-            if current_accuracy > best_accuracy:
-                best_accuracy = current_accuracy
-                print(f"✨ Tìm thấy model tốt hơn! Accuracy: {best_accuracy:.2%}")
-                
-                # Save new best model
-                model.save(best_model_path)
-                
-                # Safely replace old model
-                if os.path.exists(best_model_path):
-                    if os.path.exists(model_path):
-                        backup_path = f'backup_{datetime.now().strftime("%Y%m%d_%H%M")}_model.keras'
-                        os.rename(model_path, backup_path)
-                    os.rename(best_model_path, model_path)
-            
-            # Update metrics for web monitor
+            # Update metrics
             metrics = {
                 "accuracy": current_accuracy,
                 "best_accuracy": best_accuracy,
-                "epoch": 50,  # Always show full epochs
+                "epoch": 50,
                 "loss": history.history['loss'][-1],
                 "training_time": str(datetime.now() - start_time).split('.')[0],
                 "epochs_history": list(range(1, 51)),
@@ -490,18 +470,29 @@ def train_with_time_limit(hours, cpu_limit=95, initial_accuracy=0):
             }
             update_training_metrics(metrics)
 
-            # Rest between training cycles - reduced from 30s to 2s
-            print("\n⏳ Nghỉ 2 giây trước khi tiếp tục...\n")
-            time.sleep(2)  # Reduced from 30 to 2 seconds
+            # Save if better
+            if current_accuracy > best_accuracy:
+                print(f"✨ New best accuracy: {current_accuracy:.2%}")
+                model.save(best_model_path)
+                if os.path.exists(best_model_path):
+                    os.replace(best_model_path, model_path)
+                best_accuracy = current_accuracy
+                consecutive_fails = 0
+            else:
+                consecutive_fails += 1
+                if consecutive_fails >= max_fails:
+                    print("⚠️ Model not improving, resetting...")
+                    model = create_model(input_shape)
+                    consecutive_fails = 0
+
+            # CPU control and rest
+            limit_cpu_usage(cpu_limit)
+            time.sleep(2)
 
         except Exception as e:
-            print(f"❌ Lỗi trong quá trình train: {str(e)}")
+            print(f"❌ Training error: {str(e)}")
             time.sleep(60)
 
-        # Clear memory
-        if 'gpu' in tf.config.list_physical_devices():
-            tf.keras.backend.clear_session()
-            
     return best_accuracy
 
 def train_with_attempts(max_attempts, target_accuracy, cpu_limit=80):
@@ -684,6 +675,9 @@ def get_training_params():
 def main():
     try:
         console.print("[bold green]🚀 Khởi động chương trình huấn luyện...[/bold green]")
+        
+        install_requirements()
+        setup_environment()
         
         while True:
             display_menu()
